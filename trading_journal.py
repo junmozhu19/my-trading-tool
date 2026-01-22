@@ -3,226 +3,202 @@ import pandas as pd
 from datetime import datetime
 
 # --- 页面配置 ---
-st.set_page_config(page_title="Cathy's Discipline Trader", layout="wide")
+st.set_page_config(page_title="Pro Trader Journal", layout="wide")
 
-# --- Cathy 的核心参数 (可在此调整) ---
+# --- 常量 ---
 MULTIPLIER_US_OPT = 100
-DEFAULT_STOP_LOSS_PCT = 20.0  # 默认止损百分比
-DAILY_LOSS_LIMIT = 2000.0     # 日内最大亏损熔断线 (美元)
-CONSECUTIVE_LOSS_LIMIT = 3    # 连续止损次数限制
+DAILY_LOSS_LIMIT = 2000.0
 
-# --- 核心逻辑：全市场费用与盈亏计算 ---
-def calculate_pre_trade(market, qty, entry, stop, target):
-    """
-    计算开仓前的所有关键数据：投入、手续费、止损亏损额、止盈盈利额、盈亏比
-    """
-    multiplier = 1
-    actual_shares = qty
+# --- 辅助函数：计算单次操作盈亏 ---
+def calculate_pnl(market, qty, entry_price, exit_price):
+    multiplier = 100 if "Option" in market else 1
+    # 港股暂时假设 1
+    if "HK" in market and "CBBC" not in market: multiplier = 1 
     
-    # 1. 识别乘数
-    if market == "美股期权 (US Option)":
-        multiplier = 100
-        actual_shares = qty * 100
-    elif market == "港股牛熊 (HK CBBC)":
-        multiplier = 1 # 假设直接输入股数
-        actual_shares = qty
-    elif market == "美股正股 (US Stock)":
-        multiplier = 1
-        actual_shares = qty
-    elif market == "港股正股 (HK Stock)":
-        multiplier = 1
-        actual_shares = qty
-
-    # 2. 资金投入
-    invested = entry * actual_shares
-
-    # 3. 手续费估算 (双边)
+    trade_val = exit_price * qty * multiplier
+    
+    # 手续费 (双边估算，为了简化，这里计算的是“单次卖出动作”产生的双边费用分摊)
+    # 实际上更严谨的做法是：开仓算一次费，平仓算一次费。
+    # 这里为了保持逻辑简单：每平仓一次，扣除对应的开+平费用
     fees = 0.0
-    if market == "美股期权 (US Option)":
-        fees = max(2.0, qty * 0.8) * 2
-    elif market == "美股正股 (US Stock)":
-        fees = max(2.0, actual_shares * 0.01) * 2
+    if "Option" in market:
+        fees = max(2.0, qty * 1.0) * 2
     elif "HK" in market:
-        trade_val = invested
-        one_way = max(15.0, trade_val * 0.0003 + 15.0) # 简易估算: 佣金+平台费
-        fees = one_way * 2
+        fees = max(30.0, trade_val * 0.0006 + 30.0) # 港股较贵
+    else: # 美股正股
+        fees = max(2.0, qty * 0.01) * 2
 
-    # 4. 盈亏推演
-    # 止损时的净亏损 (含手续费)
-    loss_amt = (entry - stop) * actual_shares + fees # 注意：这里 loss_amt 是正数代表亏损额
-    if stop > entry: # 做空情况暂不考虑，假设做多
-         loss_amt = (stop - entry) * actual_shares + fees
+    gross_pl = (exit_price - entry_price) * qty * multiplier
+    net_pl = gross_pl - fees
+    return net_pl, fees
 
-    # 止盈时的净盈利 (扣手续费)
-    profit_amt = (target - entry) * actual_shares - fees
-    
-    # 盈亏比
-    rr = 0.0
-    if loss_amt > 0:
-        rr = profit_amt / loss_amt
-
-    return invested, fees, loss_amt, profit_amt, rr, actual_shares
-
-# --- 初始化数据 ---
-if 'df' not in st.session_state:
-    st.session_state.df = pd.DataFrame(columns=[
-        "ID", "Date", "Market", "Symbol", "Entry", "Qty_Display", "Actual_Shares",
-        "Stop_Price", "Target_Price", "Invested", "Fees", "Exit_Price", "Net_P_L", "Status"
+# --- 数据初始化 ---
+# 这次我们需要两个表：
+# 1. positions: 记录开仓信息
+# 2. executions: 记录平仓流水
+if 'positions' not in st.session_state:
+    st.session_state.positions = pd.DataFrame(columns=[
+        "ID", "Date", "Market", "Symbol", "Entry_Price", "Initial_Qty", 
+        "Remaining_Qty", "Stop_Price", "Target_1", "Target_2", "Status"
+    ])
+if 'executions' not in st.session_state:
+    st.session_state.executions = pd.DataFrame(columns=[
+        "Parent_ID", "Date", "Exit_Price", "Qty", "Net_P_L", "Fees", "Reason"
     ])
 
-# --- 侧边栏：Cathy 的纪律室 (实时监控) ---
-st.sidebar.title("👮‍♀️ 纪律监控室")
-
-# 1. 今日统计
+# --- 侧边栏：监控 ---
+st.sidebar.title("👮‍♀️ 纪律监控")
 today_str = datetime.now().strftime("%Y-%m-%d")
-today_trades = st.session_state.df[st.session_state.df['Date'] == today_str]
-today_closed = today_trades[today_trades['Status'] == 'Closed']
 
-today_pl = today_closed['Net_P_L'].sum()
-today_loss_count = len(today_closed[today_closed['Net_P_L'] < 0])
+# 计算今日总盈亏 (从 executions 表)
+today_execs = st.session_state.executions[st.session_state.executions['Date'] == today_str]
+today_pl = today_execs['Net_P_L'].sum() if not today_execs.empty else 0.0
 
-# 2. 熔断状态检查
-is_melt_down = False
+st.sidebar.metric("今日已实现盈亏", f"${today_pl:.2f}")
+
 if today_pl < -DAILY_LOSS_LIMIT:
-    is_melt_down = True
-    st.sidebar.error(f"🚫 **日内熔断触发！**\n今日已亏损 ${abs(today_pl):.2f} (限额 ${DAILY_LOSS_LIMIT})")
-    st.sidebar.markdown("## 🛑 停止交易！关电脑！")
-elif today_loss_count >= CONSECUTIVE_LOSS_LIMIT:
-    st.sidebar.warning(f"⚠️ **连续止损警告**\n今日已连跪 {today_loss_count} 次。\nCathy 建议：休息一下，不要上头。")
+    st.sidebar.error("🚫 触发日内熔断！停止交易！")
+    lock_trading = True
 else:
-    st.sidebar.success("✅ 状态良好，继续保持纪律。")
-
-st.sidebar.divider()
-st.sidebar.metric("今日净盈亏", f"${today_pl:.2f}")
-st.sidebar.metric("今日交易笔数", len(today_trades))
+    lock_trading = False
 
 # --- 主界面 ---
-st.title("🛡️ 交易执行终端")
+st.title("🛡️ 专业分批交易终端")
 
-# 1. 开单区 (核心)
-st.subheader("1. 制定交易计划 (Plan Your Trade)")
-
-if is_melt_down:
-    st.error("⛔ 由于触发日内亏损熔断，开仓功能已锁定。请严格遵守纪律！")
-else:
-    with st.container(border=True):
-        col_m, col_s = st.columns([1, 1])
-        market = col_m.selectbox("市场类型", ["美股期权 (US Option)", "港股牛熊 (HK CBBC)", "美股正股 (US Stock)", "港股正股 (HK Stock)"])
-        symbol = col_s.text_input("标的代码", value="NVDA").upper()
-        
-        col1, col2, col3 = st.columns(3)
-        entry_price = col1.number_input("入场价格", min_value=0.001, value=1.00, step=0.01, format="%.3f")
-        
-        # 数量输入：根据市场类型变化提示
-        if "Option" in market:
-            qty = col2.number_input("买入 **张数**", min_value=1, value=1)
-            col2.caption(f"相当于 {qty*100} 股")
-        else:
-            qty = col2.number_input("买入 **股数**", min_value=100, step=100, value=100)
-            
-        # 止损止盈输入 (Cathy 核心：默认给一个建议值，但必须确认)
-        suggested_stop = entry_price * (1 - DEFAULT_STOP_LOSS_PCT/100.0)
-        stop_price = col3.number_input(f"止损价格 (Cathy建议 < {suggested_stop:.3f})", value=suggested_stop, step=0.01, format="%.3f")
-        target_price = col3.number_input("止盈价格 (目标位)", value=entry_price * 1.5, step=0.01, format="%.3f")
-
-        st.divider()
-        
-        # 实时推演计算
-        invested, fees, potential_loss, potential_profit, rr, actual_shares = calculate_pre_trade(market, qty, entry_price, stop_price, target_price)
-        
-        # 展示推演结果
+# 1. 开仓区
+with st.expander("📝 **新建仓位 (Open Position)**", expanded=True):
+    if lock_trading:
+        st.error("已熔断，无法开仓。")
+    else:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("💰 实际投入本金", f"${invested:.2f}")
-        c2.metric("💸 触发出局亏损", f"-${potential_loss:.2f}", help="包含手续费的实际亏损")
-        c3.metric("🤑 止盈预期盈利", f"+${potential_profit:.2f}", help="扣除手续费的实际落袋")
+        market = c1.selectbox("市场", ["美股期权 (US Option)", "港股牛熊 (HK CBBC)", "美股正股 (US Stock)", "港股正股 (HK Stock)"])
+        symbol = c2.text_input("代码", value="NVDA").upper()
+        entry_price = c3.number_input("开仓均价", min_value=0.01, value=1.00)
         
-        rr_color = "normal"
-        if rr >= 2.0: rr_color = "normal" # Streamlit metric 默认绿色不好控制，用文字辅助
-        
-        c4.metric("⚖️ 盈亏比 (R:R)", f"{rr:.2f}")
+        # 数量
+        qty_label = "张数" if "Option" in market else "股数"
+        min_q = 1 if "Option" in market else 100
+        qty = c4.number_input(f"买入{qty_label}", min_value=min_q, value=min_q)
 
-        # 校验逻辑
-        can_trade = True
-        error_msg = ""
-        
-        if stop_price >= entry_price:
-            can_trade = False
-            error_msg = "❌ 止损价必须低于入场价！"
-        elif rr < 1.5:
-            st.warning("⚠️ 盈亏比低于 1.5，这笔交易不太划算，建议重新寻找入场点。")
-        elif potential_loss > 500: # 假设单笔最大亏损容忍度
-            st.warning(f"⚠️ 风险提示：如果止损，你将亏损 ${potential_loss:.0f}，这是否超出了你的心理承受力？")
+        st.caption("计划设置 (Plan)")
+        pc1, pc2, pc3 = st.columns(3)
+        stop_p = pc1.number_input("止损价", value=entry_price*0.8)
+        tgt1 = pc2.number_input("目标1 (减仓50%)", value=entry_price*1.2)
+        tgt2 = pc3.number_input("目标2 (清仓)", value=entry_price*1.5)
 
-        if not can_trade:
-            st.error(error_msg)
-            st.button("🚫 无法下单", disabled=True)
-        else:
-            if st.button("🚀 确认计划并开仓", type="primary"):
-                new_trade = {
-                    "ID": datetime.now().strftime("%H%M%S"),
-                    "Date": datetime.now().strftime("%Y-%m-%d"),
-                    "Market": market,
-                    "Symbol": symbol,
-                    "Entry": entry_price,
-                    "Qty_Display": qty,
-                    "Actual_Shares": actual_shares,
-                    "Stop_Price": stop_price,
-                    "Target_Price": target_price,
-                    "Invested": invested,
-                    "Fees": fees,
-                    "Exit_Price": 0.0,
-                    "Net_P_L": 0.0,
-                    "Status": "Open"
+        # 检查逻辑
+        valid_trade = True
+        if stop_p >= entry_price:
+            st.warning("⚠️ 止损必须低于开仓价")
+            valid_trade = False
+        
+        if valid_trade and st.button("🚀 开仓", type="primary"):
+            new_pos = {
+                "ID": datetime.now().strftime("%H%M%S"),
+                "Date": today_str,
+                "Market": market,
+                "Symbol": symbol,
+                "Entry_Price": entry_price,
+                "Initial_Qty": qty,
+                "Remaining_Qty": qty, # 初始剩余 = 初始
+                "Stop_Price": stop_p,
+                "Target_1": tgt1,
+                "Target_2": tgt2,
+                "Status": "Open"
+            }
+            st.session_state.positions = pd.concat([st.session_state.positions, pd.DataFrame([new_pos])], ignore_index=True)
+            st.toast("开仓成功！")
+            st.rerun()
+
+# 2. 持仓管理 (重点修改：支持分批)
+st.subheader("⚡ 持仓管理 (Active Positions)")
+
+active_pos = st.session_state.positions[st.session_state.positions['Status'] == 'Open']
+
+if active_pos.empty:
+    st.info("当前无持仓。")
+else:
+    for idx, row in active_pos.iterrows():
+        # 计算持仓市值/浮动盈亏 (简单版)
+        multiplier = 100 if "Option" in row['Market'] else 1
+        
+        with st.container(border=True):
+            # 标题栏
+            title_col, info_col = st.columns([1, 3])
+            title_col.markdown(f"### {row['Symbol']}")
+            title_col.caption(f"ID: {row['ID']}")
+            
+            info_col.markdown(f"""
+            **市场**: {row['Market']} | **成本**: {row['Entry_Price']} | **剩余数量**: `{row['Remaining_Qty']}` / {row['Initial_Qty']}  
+            🔴 **止损**: {row['Stop_Price']} | 🟢 **目标1**: {row['Target_1']} | 🟢 **目标2**: {row['Target_2']}
+            """)
+
+            st.divider()
+            
+            # 分批平仓操作区
+            c_price, c_qty, c_btn = st.columns([1, 1, 1])
+            
+            exit_price = c_price.number_input(f"卖出价格", key=f"p_{row['ID']}", value=row['Entry_Price'])
+            
+            # 默认卖出数量逻辑：如果剩的多，默认卖一半；如果剩的少，默认全卖
+            default_sell = row['Remaining_Qty']
+            if row['Remaining_Qty'] > 1:
+                default_sell = int(row['Remaining_Qty'] / 2)
+                
+            sell_qty = c_qty.number_input(f"卖出数量", key=f"q_{row['ID']}", 
+                                          min_value=1, max_value=int(row['Remaining_Qty']), 
+                                          value=default_sell)
+
+            # 预计算
+            est_pl, _ = calculate_pnl(row['Market'], sell_qty, row['Entry_Price'], exit_price)
+            btn_text = f"卖出 {sell_qty} (盈亏: ${est_pl:.1f})"
+            btn_color = "primary" if est_pl > 0 else "secondary"
+
+            if c_btn.button(btn_text, key=f"btn_{row['ID']}", type=btn_color):
+                # 1. 记录执行流水
+                new_exec = {
+                    "Parent_ID": row['ID'],
+                    "Date": today_str,
+                    "Exit_Price": exit_price,
+                    "Qty": sell_qty,
+                    "Net_P_L": est_pl,
+                    "Fees": 0, # 简化显示
+                    "Reason": "Manual"
                 }
-                st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_trade])], ignore_index=True)
-                st.toast("交易已录入！请严格执行止损计划！")
+                st.session_state.executions = pd.concat([st.session_state.executions, pd.DataFrame([new_exec])], ignore_index=True)
+                
+                # 2. 更新持仓状态
+                new_rem = row['Remaining_Qty'] - sell_qty
+                st.session_state.positions.at[idx, 'Remaining_Qty'] = new_rem
+                
+                if new_rem == 0:
+                    st.session_state.positions.at[idx, 'Status'] = 'Closed'
+                    st.toast(f"仓位 {row['Symbol']} 已全部平仓！")
+                else:
+                    st.toast(f"部分减仓成功！剩余 {new_rem}")
+                
                 st.rerun()
 
-# 2. 持仓管理 (Cathy 的执行)
-st.subheader("2. 持仓监控 (Active Trades)")
-active_trades = st.session_state.df[st.session_state.df['Status'] == 'Open']
+# 3. 不过夜检查 (Night Watch)
+st.subheader("🌙 收盘检查 (Night Watch)")
+st.write("点击下方按钮，检查是否有违规过夜单（期权/牛熊禁止过夜）")
 
-if active_trades.empty:
-    st.info("当前空仓。耐心等待猎物。")
-else:
-    for idx, row in active_trades.iterrows():
-        with st.expander(f"🔵 {row['Symbol']} | 成本: {row['Entry']} | 止损: {row['Stop_Price']}", expanded=True):
-            col_info, col_action = st.columns([2, 1])
-            
-            with col_info:
-                st.write(f"**数量**: {row['Qty_Display']} ({row['Market']})")
-                st.write(f"**止盈目标**: {row['Target_Price']}")
-                st.caption(f"如果不幸止损，预计亏损: -${(row['Entry'] - row['Stop_Price']) * row['Actual_Shares'] + row['Fees']:.2f}")
+if st.button("检查违规单"):
+    overnight_risks = []
+    for idx, row in active_pos.iterrows():
+        if "Option" in row['Market'] or "CBBC" in row['Market']:
+            overnight_risks.append(f"{row['Symbol']} ({row['Remaining_Qty']} 张/股)")
+    
+    if overnight_risks:
+        st.error(f"❌ **严重违规！以下头寸禁止过夜，请立即平仓：**\n" + "\n".join(overnight_risks))
+    else:
+        st.success("✅ 目前没有高风险过夜头寸。")
 
-            with col_action:
-                st.write("#### 🛑 平仓结算")
-                exit_price = st.number_input("平仓成交价", key=f"exit_{row['ID']}", value=row['Entry'])
-                
-                # 实时算盈亏
-                gross = (exit_price - row['Entry']) * row['Actual_Shares']
-                net = gross - row['Fees']
-                
-                btn_label = f"平仓 (盈亏: ${net:.2f})"
-                btn_type = "secondary"
-                if net > 0: btn_type = "primary" # 赚钱变红(primary在streamlit通常是红/黑)
-                
-                if st.button(btn_label, key=f"close_{row['ID']}", type=btn_type):
-                    st.session_state.df.at[idx, 'Status'] = 'Closed'
-                    st.session_state.df.at[idx, 'Exit_Price'] = exit_price
-                    st.session_state.df.at[idx, 'Net_P_L'] = net
-                    st.rerun()
-
-# 3. 复盘数据
+# 4. 历史明细
 st.divider()
-st.subheader("3. 历史复盘")
-st.dataframe(st.session_state.df.sort_values(by="Date", ascending=False))
+st.subheader("📜 执行明细 (Executions)")
+st.dataframe(st.session_state.executions.sort_values(by="Date", ascending=False))
 
-# 数据存取
-c1, c2 = st.columns(2)
-csv = st.session_state.df.to_csv(index=False).encode('utf-8')
-c1.download_button("💾 每日必做：下载备份", csv, "journal_backup.csv", "text/csv")
-
-uploaded = c2.file_uploader("📂 加载备份", type="csv")
-if uploaded and c2.button("确认加载"):
-    st.session_state.df = pd.read_csv(uploaded)
-    st.rerun()
+# 保存
+csv_exec = st.session_state.executions.to_csv(index=False).encode('utf-8')
+st.download_button("💾 下载交易流水", csv_exec, "executions.csv", "text/csv")
