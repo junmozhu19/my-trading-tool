@@ -3,42 +3,62 @@ import pandas as pd
 import os
 from datetime import datetime
 import math
+import io
 
 # --- 配置页面 ---
 st.set_page_config(page_title="Thorp's Edge - 交易系统", layout="wide")
 
-# --- 文件路径 ---
-DATA_FILE = "trade_data.csv"
+# --- 数据处理 ---
+# 在云端环境中，我们使用 st.session_state 来临时存储数据，防止页面刷新丢失
+# 并提供上传/下载功能来持久化数据
 
-# --- 辅助函数：加载和保存数据 ---
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return pd.DataFrame(columns=[
-            "ID", "Date", "Symbol", "Type", "Direction", 
-            "Entry_Price", "Stop_Loss", "Target_1", "Target_2", 
-            "Quantity", "Status", "Entry_Reason", "P_L", "Notes"
-        ])
-    return pd.read_csv(DATA_FILE)
+if 'df' not in st.session_state:
+    st.session_state.df = pd.DataFrame(columns=[
+        "ID", "Date", "Symbol", "Type", "Direction", 
+        "Entry_Price", "Stop_Loss", "Target_1", "Target_2", 
+        "Quantity", "Status", "Entry_Reason", "P_L", "Notes"
+    ])
 
-def save_data(df):
-    df.to_csv(DATA_FILE, index=False)
+def load_data_from_upload(uploaded_file):
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+            st.session_state.df = df
+            st.success("✅ 数据加载成功！")
+        except Exception as e:
+            st.error(f"数据加载失败: {e}")
 
-# --- 侧边栏：账户设置 ---
+def get_csv_download_link(df):
+    csv = df.to_csv(index=False).encode('utf-8')
+    return csv
+
+# --- 侧边栏：账户设置与数据管理 ---
+st.sidebar.header("📂 数据存档 (Data Persistence)")
+st.sidebar.warning("⚠️ 云端部署注意：请务必在每天结束时下载数据备份！下次使用时先上传备份文件。")
+
+# 上传
+uploaded_file = st.sidebar.file_uploader("📥 上传历史数据 (Upload CSV)", type=['csv'])
+if uploaded_file is not None:
+    # 避免重复加载
+    if st.sidebar.button("确认加载上传的数据"):
+        load_data_from_upload(uploaded_file)
+
+# 下载
+csv_data = get_csv_download_link(st.session_state.df)
+st.sidebar.download_button(
+    label="💾 下载当前数据备份 (Download CSV)",
+    data=csv_data,
+    file_name=f"trade_data_backup_{datetime.now().strftime('%Y%m%d')}.csv",
+    mime='text/csv',
+)
+
+st.sidebar.markdown("---")
 st.sidebar.header("💰 资金管理 (Money Management)")
 capital = st.sidebar.number_input("当前总本金 (Total Capital)", value=55000.0, step=1000.0)
 risk_per_trade_pct = st.sidebar.slider("单笔最大风险 % (Risk per Trade)", 0.5, 5.0, 2.0)
-win_rate_assumption = st.sidebar.slider("预估胜率 (Win Rate)", 0.3, 0.8, 0.4)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 📜 索普的教诲")
-st.sidebar.info(
-    "1. **生存第一**：永远不要让单笔亏损超过总资金的 2%。\n"
-    "2. **期望值**：只做盈亏比 > 2:1 的交易。\n"
-    "3. **纪律**：到了止损位必须走，不要抱有幻想。"
-)
 
 # --- 主界面 ---
-st.title("🛡️ Thorp's Edge - 交易日记")
+st.title("🛡️ Thorp's Edge - 交易日记 (Cloud Ver.)")
 
 tab1, tab2, tab3 = st.tabs(["➕ 交易计划 (Plan)", "⚡ 持仓管理 (Active)", "📊 历史复盘 (History)"])
 
@@ -62,7 +82,6 @@ with tab1:
         st.subheader("2. 风险评估 & 仓位建议")
         
         if entry_price > 0 and stop_loss > 0 and target_1 > 0:
-            # 计算风险回报比
             risk = abs(entry_price - stop_loss)
             reward = abs(target_1 - entry_price)
             
@@ -70,41 +89,25 @@ with tab1:
                 st.error("止损价不能等于入场价！")
             else:
                 rr_ratio = reward / risk
-                
-                st.metric("单股风险 (Risk)", f"{risk:.3f}")
-                st.metric("单股潜在盈利 (Reward)", f"{reward:.3f}")
+                st.metric("单股风险", f"{risk:.3f}")
+                st.metric("单股潜在盈利", f"{reward:.3f}")
                 
                 st.write("---")
-                st.write("#### ⚖️ 盈亏比 (R:R Ratio)")
                 if rr_ratio >= 2.0:
-                    st.success(f"**{rr_ratio:.2f} : 1** (优秀，值得交易)")
+                    st.success(f"盈亏比 **{rr_ratio:.2f} : 1** (优秀)")
                 elif rr_ratio >= 1.5:
-                    st.warning(f"**{rr_ratio:.2f} : 1** (勉强，需谨慎)")
+                    st.warning(f"盈亏比 **{rr_ratio:.2f} : 1** (勉强)")
                 else:
-                    st.error(f"**{rr_ratio:.2f} : 1** (太低了！索普不建议开单)")
+                    st.error(f"盈亏比 **{rr_ratio:.2f} : 1** (索普不建议开单)")
                 
-                st.write("---")
-                st.write("#### 🛡️ 仓位建议 (Position Size)")
-                
-                # 计算最大允许亏损金额
                 max_loss_amount = capital * (risk_per_trade_pct / 100.0)
-                # 计算建议仓位
                 suggested_qty = math.floor(max_loss_amount / risk)
                 
-                st.info(f"你的总资金: {capital}")
-                st.info(f"单笔最大允许亏损 ({risk_per_trade_pct}%): **${max_loss_amount:.2f}**")
-                
-                if suggested_qty <= 0:
-                    st.error("无法开仓：单股风险已超过你的最大允许亏损！")
-                else:
-                    st.success(f"🔥 索普建议最大买入数量: **{suggested_qty}** 股/张")
-                    st.caption(f"总投入金额: ${suggested_qty * entry_price:.2f}")
+                st.info(f"建议仓位: **{suggested_qty}** 股/张 (基于 {risk_per_trade_pct}% 风险)")
 
-                # 确认开仓按钮
                 if rr_ratio >= 1.5 and suggested_qty > 0:
                     actual_qty = st.number_input("实际买入数量", value=suggested_qty, step=1)
-                    if st.button("🚀 记录这笔交易 (Execute Trade)"):
-                        df = load_data()
+                    if st.button("🚀 记录这笔交易"):
                         new_trade = {
                             "ID": datetime.now().strftime("%Y%m%d%H%M%S"),
                             "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -116,106 +119,52 @@ with tab1:
                             "Target_1": target_1,
                             "Target_2": target_2,
                             "Quantity": actual_qty,
-                            "Status": "Open", # Open, Half_Closed, Closed
+                            "Status": "Open",
                             "Entry_Reason": entry_reason,
                             "P_L": 0.0,
                             "Notes": ""
                         }
-                        df = pd.concat([df, pd.DataFrame([new_trade])], ignore_index=True)
-                        save_data(df)
-                        st.toast("交易已记录！祝你好运！")
+                        st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_trade])], ignore_index=True)
+                        st.toast("交易已记录！请记得下载备份！")
                         st.balloons()
 
 # --- Tab 2: 持仓管理 ---
 with tab2:
-    st.header("⚡ 当前持仓 (Active Trades)")
-    df = load_data()
+    st.header("⚡ 当前持仓")
+    # 使用 session_state 中的 df
+    df = st.session_state.df
     active_trades = df[df["Status"].isin(["Open", "Half_Closed"])]
     
     if active_trades.empty:
-        st.info("当前没有持仓。去制定计划吧！")
+        st.info("无活动持仓。")
     else:
         for index, row in active_trades.iterrows():
-            with st.expander(f"{row['Symbol']} ({row['Type']}) - {row['Status']} - {row['Date']}", expanded=True):
-                col_a, col_b, col_c = st.columns(3)
+            with st.expander(f"{row['Symbol']} - {row['Status']}", expanded=True):
+                col_a, col_b = st.columns(2)
                 with col_a:
-                    st.write(f"**入场价**: {row['Entry_Price']}")
-                    st.write(f"**当前止损**: {row['Stop_Loss']}")
+                    st.write(f"入场: {row['Entry_Price']} | 止损: {row['Stop_Loss']}")
                 with col_b:
-                    st.write(f"**目标1**: {row['Target_1']}")
-                    st.write(f"**目标2**: {row['Target_2']}")
-                with col_c:
-                    st.write(f"**数量**: {row['Quantity']}")
-                    st.write(f"**方向**: {row['Direction']}")
-                
-                st.write(f"**理由**: {row['Entry_Reason']}")
-                
-                st.write("---")
-                st.write("**操作面板:**")
+                    st.write(f"数量: {row['Quantity']} | 方向: {row['Direction']}")
                 
                 c1, c2, c3 = st.columns(3)
-                
-                # 操作 1: 达到目标 1
                 if row['Status'] == 'Open':
-                    if c1.button("🎯 达到目标位 1 (Hit T1)", key=f"t1_{row['ID']}"):
-                        # 逻辑：平仓一半，修改状态，提醒移动止损
-                        df.at[index, 'Status'] = 'Half_Closed'
-                        df.at[index, 'Notes'] += f"T1 Hit. Sold 50%. Stop moved to {row['Entry_Price']}. "
-                        # 移动止损到开仓价
-                        df.at[index, 'Stop_Loss'] = row['Entry_Price']
-                        save_data(df)
+                    if c1.button("🎯 达标减半", key=f"t1_{row['ID']}"):
+                        st.session_state.df.at[index, 'Status'] = 'Half_Closed'
+                        st.session_state.df.at[index, 'Stop_Loss'] = row['Entry_Price']
+                        st.session_state.df.at[index, 'Notes'] += "T1 Hit. "
                         st.rerun()
                 
-                # 操作 2: 止损离场
-                if c2.button("🛑 止损离场 (Stopped Out)", key=f"stop_{row['ID']}"):
-                    exit_price = st.number_input("止损成交价", key=f"price_stop_{row['ID']}")
+                if c3.button("💰 全部平仓", key=f"close_{row['ID']}"):
+                    exit_price = st.number_input("平仓价", key=f"p_{row['ID']}")
                     if exit_price > 0:
-                        df.at[index, 'Status'] = 'Closed'
-                        # 简单盈亏计算 (需根据做多做空调整)
+                        st.session_state.df.at[index, 'Status'] = 'Closed'
+                        # 简易计算
                         qty = row['Quantity'] if row['Status'] == 'Open' else row['Quantity'] / 2
-                        if "Long" in row['Direction']:
-                            pl = (exit_price - row['Entry_Price']) * qty
-                        else:
-                            pl = (row['Entry_Price'] - exit_price) * qty
-                        
-                        df.at[index, 'P_L'] = df.at[index, 'P_L'] + pl
-                        df.at[index, 'Notes'] += f"Stopped out at {exit_price}. "
-                        save_data(df)
+                        pl = (exit_price - row['Entry_Price']) * qty if "Long" in row['Direction'] else (row['Entry_Price'] - exit_price) * qty
+                        st.session_state.df.at[index, 'P_L'] += pl
                         st.rerun()
 
-                # 操作 3: 完全止盈/平仓
-                if c3.button("💰 完全止盈/平仓 (Close All)", key=f"close_{row['ID']}"):
-                    exit_price = st.number_input("平仓成交价", key=f"price_close_{row['ID']}")
-                    if exit_price > 0:
-                        df.at[index, 'Status'] = 'Closed'
-                        # 计算盈亏
-                        qty = row['Quantity'] if row['Status'] == 'Open' else row['Quantity'] / 2
-                        if "Long" in row['Direction']:
-                            pl = (exit_price - row['Entry_Price']) * qty
-                        else:
-                            pl = (row['Entry_Price'] - exit_price) * qty
-                            
-                        # 如果之前平了一半，要加上之前的那部分利润（这里简化处理，假设T1没记录具体价格，只记录最后这笔。
-                        # *为了更精确，建议T1时也记录一笔P_L，这里暂做简化*
-                        
-                        df.at[index, 'P_L'] = df.at[index, 'P_L'] + pl
-                        df.at[index, 'Notes'] += f"Closed all at {exit_price}. "
-                        save_data(df)
-                        st.rerun()
-                
-                if row['Status'] == 'Half_Closed':
-                    st.warning(f"⚠️ **注意**：你已经减仓一半。现在的止损价应该已经是 **{row['Entry_Price']}** (保本损)！")
-
-# --- Tab 3: 历史复盘 ---
+# --- Tab 3: 历史 ---
 with tab3:
-    st.header("📜 历史交易 (Trade History)")
-    df = load_data()
-    closed_trades = df[df["Status"] == "Closed"]
-    
-    if not closed_trades.empty:
-        st.dataframe(closed_trades)
-        
-        total_pl = closed_trades['P_L'].sum()
-        st.metric("总盈亏 (Total P/L)", f"${total_pl:.2f}", delta=total_pl)
-    else:
-        st.info("暂无已平仓的交易记录。")
+    st.header("📜 历史记录")
+    st.dataframe(st.session_state.df)
