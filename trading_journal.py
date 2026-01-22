@@ -5,181 +5,221 @@ from datetime import datetime
 import io
 
 # --- 页面配置 ---
-st.set_page_config(page_title="Thorp's Edge - 实战版", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Thorp's Edge - Cathy Rules", layout="wide")
 
-# --- 核心逻辑：手续费计算器 ---
-def calculate_fees(market, qty, price, order_amount=0):
+# --- Cathy 的核心规则配置 (可调整) ---
+MULTIPLIER_US_OPT = 100  # 美股期权 1张=100股
+DEFAULT_STOP_LOSS_PCT = 20.0  # 默认20%止损
+
+# --- 核心逻辑：费用与盈亏计算 ---
+def calculate_financials(market, qty, price, stop_loss, target, lot_size=1):
     """
-    计算富途牛牛估算手续费 (双向：买+卖)
+    计算实际投入金额、手续费、止损止盈金额
     """
+    contract_multiplier = 1
+    if market == "US_Option":
+        contract_multiplier = 100
+    elif market == "HK_CBBC":
+        contract_multiplier = lot_size # 港股需要输入每手股数，或者这里假设 qty 就是股数? 
+        # 通常港股报价 0.050，买入是一手 10000 股。
+        # 为了防歧义，我们让用户输入“买入股数”而不是“手”。
+        contract_multiplier = 1 
+
+    # 实际投入本金 (Principal)
+    # 美股期权: 1.00 * 3张 * 100 = 300元
+    invested_amount = price * qty * contract_multiplier
+    
+    # 手续费计算
     fees = 0.0
-    if market == "US_Option": # 美股期权
-        # 佣金: $0.65/张, 最低 $1.99
-        commission = max(1.99, qty * 0.65)
-        # 平台费: $0.30/张, 最低 $1.00 (假设套餐)
-        platform = max(1.00, qty * 0.30)
-        # 监管费等杂费 (预估 $0.05/张)
-        other = qty * 0.05
-        # 单边总计
-        one_way = commission + platform + other
-        fees = one_way * 2 # 买入+卖出
-        
-    elif market == "HK_CBBC": # 港股牛熊证
-        # 佣金: 0.03% * 交易额, 最低 HK$3.00
-        commission = max(3.00, order_amount * 0.0003)
-        # 平台费: HK$15.00/笔
-        platform = 15.00
-        # 交易征费等 (约 0.00565%)
-        other = order_amount * 0.0000565 + 5.0 # +5块结算费
-        # 单边
-        one_way = commission + platform + other
+    if market == "US_Option": 
+        # 佣金 $0.65/张 + 平台费 $0.30/张 + 杂费 (最低 $1.99 + $1.00)
+        # 简单估算：每张 $2.0 (保守估计)
+        # 很多券商单笔最低 $2-$3
+        fees = max(2.0, qty * 1.0) * 2 # 买卖双边
+    elif market == "HK_CBBC":
+        # 港股: 0.03% + 15 + 5
+        trade_val = invested_amount
+        one_way = max(3.0, trade_val * 0.0003) + 15.0 + 5.0 + (trade_val * 0.00005)
         fees = one_way * 2
-        
-    elif market == "US_Stock": # 美股正股
-        # 简易估算: $0.0049/股, 最低 $0.99
-        commission = max(0.99, qty * 0.0049)
-        platform = max(1.00, qty * 0.005)
-        fees = (commission + platform) * 2
 
-    return round(fees, 2)
+    # 盈亏金额计算
+    # 止损金额 (负数)
+    loss_amt = (stop_loss - price) * qty * contract_multiplier - fees
+    # 止盈金额 (正数)
+    profit_amt = (target - price) * qty * contract_multiplier - fees
+    
+    return invested_amount, fees, loss_amt, profit_amt
 
-# --- 数据状态 ---
+# --- 状态管理 ---
 if 'df' not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=[
-        "ID", "Date", "Market", "Symbol", "Direction", 
-        "Entry_Price", "Quantity", "Stop_Loss", "Target", 
-        "Fees_Est", "Status", "P_L", "Notes"
+        "ID", "Date", "Market", "Symbol", "Entry", "Qty", 
+        "Stop", "Target", "Invested", "Fees", "P_L", "Status"
     ])
+if 'daily_loss' not in st.session_state:
+    st.session_state.daily_loss = 0.0
+if 'daily_wins' not in st.session_state:
+    st.session_state.daily_wins = 0.0
+if 'consecutive_losses' not in st.session_state:
+    st.session_state.consecutive_losses = 0
 
-# --- 侧边栏：资金池 ---
-st.sidebar.header("💰 我的小金库")
-capital_option = st.sidebar.number_input("美股期权本金 ($)", value=700.0, help="约5000人民币")
-capital_cbbc = st.sidebar.number_input("港股牛熊本金 (HK$)", value=5500.0, help="约5000人民币")
-capital_stock = st.sidebar.number_input("正股本金 (¥/HK/$)", value=30000.0)
+# --- 侧边栏：Cathy 的纪律面板 ---
+st.sidebar.title("👮‍♀️ Cathy 的纪律室")
+
+st.sidebar.markdown("### 1. 每日熔断阀")
+daily_loss_limit = st.sidebar.number_input("日内最大亏损额 ($)", value=200.0, help="如果你今天亏了这么多，必须关电脑")
+st.sidebar.metric("今日已亏损", f"${st.session_state.daily_loss:.2f}", delta=-st.session_state.daily_loss)
+
+if st.session_state.daily_loss >= daily_loss_limit:
+    st.sidebar.error("🚫 触发日内熔断！请立即停止交易！")
+
+st.sidebar.markdown("### 2. 连跪计数器")
+st.sidebar.metric("今日连续止损次数", f"{st.session_state.consecutive_losses}", help="如果连续3次，请休息")
+if st.session_state.consecutive_losses >= 3:
+    st.sidebar.warning("☕ 连续止损3次，请去喝杯咖啡，冷静一下。")
+
+st.sidebar.markdown("### 3. 盈利目标")
+daily_target = st.sidebar.number_input("日内盈利目标 ($)", value=200.0)
+st.sidebar.metric("今日已盈利", f"${st.session_state.daily_wins:.2f}")
+if st.session_state.daily_wins >= daily_target:
+    st.sidebar.success("🎉 目标达成！可以下班陪家人了！")
 
 # --- 主界面 ---
-st.title("🛡️ Thorp's Edge - 交易模拟台")
+st.title("🛡️ Thorp's Edge x Cathy Rules")
+
+st.info("💡 **原则**：盈利 = 赚得多 - 赔得少。只做盈亏比合理的事。")
 
 col1, col2 = st.columns([1, 1.5])
 
 with col1:
-    st.subheader("1. 选筹与定价")
-    market_type = st.selectbox("我要玩什么？", ["美股期权 (US Option)", "港股牛熊 (HK CBBC)", "正股 (Stock)"])
+    st.subheader("📝 交易录入")
+    market = st.selectbox("市场", ["美股期权 (US Option)", "港股牛熊 (HK CBBC)"])
+    symbol = st.text_input("代码", value="NVDA Call").upper()
     
-    symbol = st.text_input("代码 (如 NVDA 240202 Call)", value="NVDA Call").upper()
-    direction = st.radio("方向", ["做多 (Long)", "做空 (Short)"], horizontal=True)
+    # 价格录入
+    entry_price = st.number_input("现价/买入价", value=1.00, step=0.01)
     
-    # 价格输入
-    st.info("👇 请输入 **期权/牛熊证** 的实际价格，不是正股价格！")
-    entry_price = st.number_input("现价/买入价", value=0.0, step=0.01, format="%.3f")
+    # 止损逻辑：默认 20%
+    stop_price_default = entry_price * (1 - DEFAULT_STOP_LOSS_PCT/100.0)
+    stop_loss = st.number_input(f"止损价 (默认 -{DEFAULT_STOP_LOSS_PCT}%)", value=stop_price_default, step=0.01, format="%.3f")
     
-    # 数量选择
-    if "Option" in market_type:
-        max_qty = 10 # 期权限制
-        st.write("🛑 **新手保护**：期权每次建议不超过 3 张")
+    # 止盈逻辑
+    target_price = st.number_input("目标价 (止盈)", value=entry_price * 1.4, step=0.01, format="%.3f")
+    
+    # 数量逻辑
+    if market == "US_Option":
+        st.write("📦 **单位：张** (1张=100股)")
+        qty = st.number_input("买入张数", min_value=1, value=1)
+        lot_size = 100
     else:
-        max_qty = 10000
-        
-    qty = st.number_input("买入数量 (张/股)", min_value=1, max_value=max_qty, value=1)
+        st.write("📦 **单位：股** (注意港股一手可能是10000股)")
+        qty = st.number_input("买入股数", min_value=100, step=100, value=10000)
+        lot_size = 1
 
-    # 资金检查
-    total_cost = entry_price * qty
-    fees = 0.0
+    # 计算
+    invested, fees, loss_amt, profit_amt = calculate_financials(market, qty, entry_price, stop_loss, target_price, lot_size)
     
-    if "Option" in market_type:
-        fees = calculate_fees("US_Option", qty, entry_price)
-        st.caption(f"预计总手续费 (买+卖): ${fees}")
-        if total_cost + fees/2 > capital_option:
-            st.error(f"❌ 钱不够！需要 ${total_cost + fees/2:.2f}，你只有 ${capital_option}")
-    elif "CBBC" in market_type:
-        fees = calculate_fees("HK_CBBC", qty, entry_price, total_cost)
-        st.caption(f"预计总手续费 (买+卖): HK${fees}")
-        if total_cost + fees/2 > capital_cbbc:
-            st.error(f"❌ 钱不够！需要 HK${total_cost + fees/2:.2f}，你只有 HK${capital_cbbc}")
+    # 资金限制检查
+    max_invest_per_trade = st.number_input("单笔最大投入限制 ($)", value=500.0)
+    
+    if invested > max_invest_per_trade:
+        st.error(f"❌ 违规！投入金额 ${invested:.0f} 超过了你的限制 ${max_invest_per_trade}！")
+    else:
+        st.caption(f"✅ 实际投入: ${invested:.2f} | 预计手续费: ${fees:.2f}")
 
 with col2:
-    st.subheader("2. 盈亏模拟器 (所见即所得)")
+    st.subheader("⚖️ 盈亏天平")
     
-    if entry_price > 0:
-        # 止损止盈设置
-        stop_loss = st.number_input("止损价 (打到这必须跑)", value=entry_price * 0.9, format="%.3f")
-        target_price = st.number_input("目标价 (止盈)", value=entry_price * 1.2, format="%.3f")
-        
-        # 模拟计算
-        potential_loss = (abs(entry_price - stop_loss) * qty) + fees
-        potential_profit = (abs(target_price - entry_price) * qty) - fees
-        
-        # 展示卡片
-        c1, c2 = st.columns(2)
-        c1.metric("😭 如果止损 (含手续费)", f"-{potential_loss:.2f}", delta_color="inverse")
-        c2.metric("🤑 如果止盈 (扣手续费)", f"+{potential_profit:.2f}")
-        
-        # 盈亏比计算
-        if potential_loss > 0:
-            rr = potential_profit / potential_loss
-            if rr > 2:
-                st.success(f"✅ 盈亏比 {rr:.2f} : 1 (值得博！)")
-            else:
-                st.warning(f"⚠️ 盈亏比 {rr:.2f} : 1 (不太划算，手续费吃太多了)")
-        
-        # 动态滑块
-        st.write("---")
-        st.write("🎚️ **拖动滑块，看看价格变动对钱包的影响：**")
-        sim_change = st.slider("价格变化 %", -50, 100, 0)
-        sim_price = entry_price * (1 + sim_change / 100.0)
-        
-        if "Long" in direction:
-            gross_pl = (sim_price - entry_price) * qty
-        else:
-            gross_pl = (entry_price - sim_price) * qty
-            
-        net_pl = gross_pl - fees # 扣除双边手续费
-        
-        st.write(f"价格变为: **{sim_price:.3f}**")
-        if net_pl > 0:
-            st.markdown(f"### 🎉 净赚: **+{net_pl:.2f}**")
-        else:
-            st.markdown(f"### 💸 净亏: **{net_pl:.2f}**")
-            
-        # 记录按钮
-        if st.button("📝 既然算好了，就记下来！", type="primary"):
+    # 核心展示卡片
+    c1, c2, c3 = st.columns(3)
+    c1.metric("💸 如果止损 (-20%)", f"{loss_amt:.2f}", help="包含手续费亏损")
+    c2.metric("💰 如果止盈", f"+{profit_amt:.2f}", help="扣除手续费盈利")
+    
+    # 盈亏比
+    risk = abs(loss_amt)
+    reward = profit_amt
+    if risk > 0:
+        rr = reward / risk
+        c3.metric("盈亏比 (R:R)", f"{rr:.2f}")
+    
+    st.write("---")
+    
+    # 决策区
+    if risk > 0 and rr < 1.5:
+        st.warning("⚠️ **不建议交易**：盈亏比低于 1.5，这笔交易不划算！")
+    elif invested > max_invest_per_trade:
+        st.error("🚫 **禁止交易**：仓位过重！")
+    elif st.session_state.daily_loss >= daily_loss_limit:
+        st.error("🚫 **禁止交易**：今日已熔断！")
+    else:
+        st.success("✅ **符合纪律**：可以开单")
+        if st.button("🚀 执行交易 (Execute)", type="primary"):
             new_trade = {
                 "ID": datetime.now().strftime("%H%M%S"),
                 "Date": datetime.now().strftime("%Y-%m-%d"),
-                "Market": market_type,
+                "Market": market,
                 "Symbol": symbol,
-                "Direction": direction,
-                "Entry_Price": entry_price,
-                "Quantity": qty,
-                "Stop_Loss": stop_loss,
+                "Entry": entry_price,
+                "Qty": qty,
+                "Stop": stop_loss,
                 "Target": target_price,
-                "Fees_Est": fees,
-                "Status": "Open",
-                "P_L": 0.0,
-                "Notes": ""
+                "Invested": invested,
+                "Fees": fees,
+                "P_L": 0.0, # 初始未平仓
+                "Status": "Open"
             }
             st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_trade])], ignore_index=True)
-            st.toast("已保存到下方表格")
+            st.toast("交易已记录！祝你好运！")
 
-st.markdown("---")
-st.subheader("📋 交易记录本")
+st.write("---")
+st.subheader("⚡ 持仓与平仓")
 
-# 显示记录
+# 持仓列表
+active_trades = st.session_state.df[st.session_state.df["Status"] == "Open"]
+if not active_trades.empty:
+    for idx, row in active_trades.iterrows():
+        with st.expander(f"{row['Symbol']} (成本 {row['Entry']})", expanded=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.write(f"投入: ${row['Invested']:.2f}")
+                st.write(f"止损: {row['Stop']} (预计亏 {row['Invested'] * 0.2:.2f})")
+            
+            with col_b:
+                # 平仓按钮
+                close_price = st.number_input(f"平仓价格", key=f"cp_{row['ID']}")
+                if st.button("平仓结算", key=f"btn_{row['ID']}"):
+                    # 计算最终盈亏
+                    multiplier = 100 if row['Market'] == "US_Option" else 1
+                    gross_pl = (close_price - row['Entry']) * row['Qty'] * multiplier
+                    net_pl = gross_pl - row['Fees'] # 扣除双边手续费
+                    
+                    # 更新数据
+                    st.session_state.df.at[idx, 'Status'] = 'Closed'
+                    st.session_state.df.at[idx, 'P_L'] = net_pl
+                    
+                    # 更新今日统计
+                    if net_pl < 0:
+                        st.session_state.daily_loss += abs(net_pl)
+                        st.session_state.consecutive_losses += 1
+                        st.error(f"止损离场。亏损 ${abs(net_pl):.2f}")
+                    else:
+                        st.session_state.daily_wins += net_pl
+                        st.session_state.consecutive_losses = 0 # 盈利清空连跪
+                        st.success(f"盈利离场！赚取 ${net_pl:.2f}")
+                    
+                    st.rerun()
+
+# 历史记录
+st.write("---")
+st.subheader("📜 今日战绩")
 st.dataframe(st.session_state.df)
 
-# 数据下载区
+# 下载
 csv = st.session_state.df.to_csv(index=False).encode('utf-8')
-st.download_button(
-    "💾 下载备份 (记得每天点一下)",
-    csv,
-    "my_trading_journal.csv",
-    "text/csv",
-    key='download-csv'
-)
+st.download_button("💾 下载今日复盘数据", csv, "cathy_journal.csv", "text/csv")
 
-# 上传区
-uploaded = st.file_uploader("📥 上传旧数据", type="csv")
-if uploaded:
-    if st.button("加载数据"):
-        st.session_state.df = pd.read_csv(uploaded)
-        st.rerun()
+# 上传
+uploaded = st.file_uploader("📥 加载旧数据", type="csv")
+if uploaded and st.button("加载"):
+    st.session_state.df = pd.read_csv(uploaded)
+    st.rerun()
