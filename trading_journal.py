@@ -1,170 +1,185 @@
 import streamlit as st
 import pandas as pd
-import os
-from datetime import datetime
 import math
+from datetime import datetime
 import io
 
-# --- 配置页面 ---
-st.set_page_config(page_title="Thorp's Edge - 交易系统", layout="wide")
+# --- 页面配置 ---
+st.set_page_config(page_title="Thorp's Edge - 实战版", layout="wide", initial_sidebar_state="expanded")
 
-# --- 数据处理 ---
-# 在云端环境中，我们使用 st.session_state 来临时存储数据，防止页面刷新丢失
-# 并提供上传/下载功能来持久化数据
+# --- 核心逻辑：手续费计算器 ---
+def calculate_fees(market, qty, price, order_amount=0):
+    """
+    计算富途牛牛估算手续费 (双向：买+卖)
+    """
+    fees = 0.0
+    if market == "US_Option": # 美股期权
+        # 佣金: $0.65/张, 最低 $1.99
+        commission = max(1.99, qty * 0.65)
+        # 平台费: $0.30/张, 最低 $1.00 (假设套餐)
+        platform = max(1.00, qty * 0.30)
+        # 监管费等杂费 (预估 $0.05/张)
+        other = qty * 0.05
+        # 单边总计
+        one_way = commission + platform + other
+        fees = one_way * 2 # 买入+卖出
+        
+    elif market == "HK_CBBC": # 港股牛熊证
+        # 佣金: 0.03% * 交易额, 最低 HK$3.00
+        commission = max(3.00, order_amount * 0.0003)
+        # 平台费: HK$15.00/笔
+        platform = 15.00
+        # 交易征费等 (约 0.00565%)
+        other = order_amount * 0.0000565 + 5.0 # +5块结算费
+        # 单边
+        one_way = commission + platform + other
+        fees = one_way * 2
+        
+    elif market == "US_Stock": # 美股正股
+        # 简易估算: $0.0049/股, 最低 $0.99
+        commission = max(0.99, qty * 0.0049)
+        platform = max(1.00, qty * 0.005)
+        fees = (commission + platform) * 2
 
+    return round(fees, 2)
+
+# --- 数据状态 ---
 if 'df' not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=[
-        "ID", "Date", "Symbol", "Type", "Direction", 
-        "Entry_Price", "Stop_Loss", "Target_1", "Target_2", 
-        "Quantity", "Status", "Entry_Reason", "P_L", "Notes"
+        "ID", "Date", "Market", "Symbol", "Direction", 
+        "Entry_Price", "Quantity", "Stop_Loss", "Target", 
+        "Fees_Est", "Status", "P_L", "Notes"
     ])
 
-def load_data_from_upload(uploaded_file):
-    if uploaded_file is not None:
-        try:
-            df = pd.read_csv(uploaded_file)
-            st.session_state.df = df
-            st.success("✅ 数据加载成功！")
-        except Exception as e:
-            st.error(f"数据加载失败: {e}")
-
-def get_csv_download_link(df):
-    csv = df.to_csv(index=False).encode('utf-8')
-    return csv
-
-# --- 侧边栏：账户设置与数据管理 ---
-st.sidebar.header("📂 数据存档 (Data Persistence)")
-st.sidebar.warning("⚠️ 云端部署注意：请务必在每天结束时下载数据备份！下次使用时先上传备份文件。")
-
-# 上传
-uploaded_file = st.sidebar.file_uploader("📥 上传历史数据 (Upload CSV)", type=['csv'])
-if uploaded_file is not None:
-    # 避免重复加载
-    if st.sidebar.button("确认加载上传的数据"):
-        load_data_from_upload(uploaded_file)
-
-# 下载
-csv_data = get_csv_download_link(st.session_state.df)
-st.sidebar.download_button(
-    label="💾 下载当前数据备份 (Download CSV)",
-    data=csv_data,
-    file_name=f"trade_data_backup_{datetime.now().strftime('%Y%m%d')}.csv",
-    mime='text/csv',
-)
-
-st.sidebar.markdown("---")
-st.sidebar.header("💰 资金管理 (Money Management)")
-capital = st.sidebar.number_input("当前总本金 (Total Capital)", value=55000.0, step=1000.0)
-risk_per_trade_pct = st.sidebar.slider("单笔最大风险 % (Risk per Trade)", 0.5, 5.0, 2.0)
+# --- 侧边栏：资金池 ---
+st.sidebar.header("💰 我的小金库")
+capital_option = st.sidebar.number_input("美股期权本金 ($)", value=700.0, help="约5000人民币")
+capital_cbbc = st.sidebar.number_input("港股牛熊本金 (HK$)", value=5500.0, help="约5000人民币")
+capital_stock = st.sidebar.number_input("正股本金 (¥/HK/$)", value=30000.0)
 
 # --- 主界面 ---
-st.title("🛡️ Thorp's Edge - 交易日记 (Cloud Ver.)")
+st.title("🛡️ Thorp's Edge - 交易模拟台")
 
-tab1, tab2, tab3 = st.tabs(["➕ 交易计划 (Plan)", "⚡ 持仓管理 (Active)", "📊 历史复盘 (History)"])
+col1, col2 = st.columns([1, 1.5])
 
-# --- Tab 1: 交易计划计算器 ---
-with tab1:
-    col1, col2 = st.columns(2)
+with col1:
+    st.subheader("1. 选筹与定价")
+    market_type = st.selectbox("我要玩什么？", ["美股期权 (US Option)", "港股牛熊 (HK CBBC)", "正股 (Stock)"])
     
-    with col1:
-        st.subheader("1. 输入参数")
-        symbol = st.text_input("标的代码 (Symbol)", value="NVDA").upper()
-        trade_type = st.selectbox("类型 (Type)", ["正股 (Stock)", "期权 (Option)", "牛熊证 (CBBC)"])
-        direction = st.radio("方向 (Direction)", ["做多 (Long)", "做空 (Short)"], horizontal=True)
-        
-        entry_price = st.number_input("入场价 (Entry Price)", value=0.0, step=0.01, format="%.3f")
-        stop_loss = st.number_input("止损价 (Stop Loss)", value=0.0, step=0.01, format="%.3f")
-        target_1 = st.number_input("目标价1 / 阻力位1 (Target 1)", value=0.0, step=0.01, format="%.3f")
-        target_2 = st.number_input("目标价2 / 阻力位2 (Target 2)", value=0.0, step=0.01, format="%.3f")
-        entry_reason = st.text_area("入场理由 (Entry Reason)", placeholder="例如：突破20日均线，群主提示阻力位在...")
-
-    with col2:
-        st.subheader("2. 风险评估 & 仓位建议")
-        
-        if entry_price > 0 and stop_loss > 0 and target_1 > 0:
-            risk = abs(entry_price - stop_loss)
-            reward = abs(target_1 - entry_price)
-            
-            if risk == 0:
-                st.error("止损价不能等于入场价！")
-            else:
-                rr_ratio = reward / risk
-                st.metric("单股风险", f"{risk:.3f}")
-                st.metric("单股潜在盈利", f"{reward:.3f}")
-                
-                st.write("---")
-                if rr_ratio >= 2.0:
-                    st.success(f"盈亏比 **{rr_ratio:.2f} : 1** (优秀)")
-                elif rr_ratio >= 1.5:
-                    st.warning(f"盈亏比 **{rr_ratio:.2f} : 1** (勉强)")
-                else:
-                    st.error(f"盈亏比 **{rr_ratio:.2f} : 1** (索普不建议开单)")
-                
-                max_loss_amount = capital * (risk_per_trade_pct / 100.0)
-                suggested_qty = math.floor(max_loss_amount / risk)
-                
-                st.info(f"建议仓位: **{suggested_qty}** 股/张 (基于 {risk_per_trade_pct}% 风险)")
-
-                if rr_ratio >= 1.5 and suggested_qty > 0:
-                    actual_qty = st.number_input("实际买入数量", value=suggested_qty, step=1)
-                    if st.button("🚀 记录这笔交易"):
-                        new_trade = {
-                            "ID": datetime.now().strftime("%Y%m%d%H%M%S"),
-                            "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "Symbol": symbol,
-                            "Type": trade_type,
-                            "Direction": direction,
-                            "Entry_Price": entry_price,
-                            "Stop_Loss": stop_loss,
-                            "Target_1": target_1,
-                            "Target_2": target_2,
-                            "Quantity": actual_qty,
-                            "Status": "Open",
-                            "Entry_Reason": entry_reason,
-                            "P_L": 0.0,
-                            "Notes": ""
-                        }
-                        st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_trade])], ignore_index=True)
-                        st.toast("交易已记录！请记得下载备份！")
-                        st.balloons()
-
-# --- Tab 2: 持仓管理 ---
-with tab2:
-    st.header("⚡ 当前持仓")
-    # 使用 session_state 中的 df
-    df = st.session_state.df
-    active_trades = df[df["Status"].isin(["Open", "Half_Closed"])]
+    symbol = st.text_input("代码 (如 NVDA 240202 Call)", value="NVDA Call").upper()
+    direction = st.radio("方向", ["做多 (Long)", "做空 (Short)"], horizontal=True)
     
-    if active_trades.empty:
-        st.info("无活动持仓。")
+    # 价格输入
+    st.info("👇 请输入 **期权/牛熊证** 的实际价格，不是正股价格！")
+    entry_price = st.number_input("现价/买入价", value=0.0, step=0.01, format="%.3f")
+    
+    # 数量选择
+    if "Option" in market_type:
+        max_qty = 10 # 期权限制
+        st.write("🛑 **新手保护**：期权每次建议不超过 3 张")
     else:
-        for index, row in active_trades.iterrows():
-            with st.expander(f"{row['Symbol']} - {row['Status']}", expanded=True):
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.write(f"入场: {row['Entry_Price']} | 止损: {row['Stop_Loss']}")
-                with col_b:
-                    st.write(f"数量: {row['Quantity']} | 方向: {row['Direction']}")
-                
-                c1, c2, c3 = st.columns(3)
-                if row['Status'] == 'Open':
-                    if c1.button("🎯 达标减半", key=f"t1_{row['ID']}"):
-                        st.session_state.df.at[index, 'Status'] = 'Half_Closed'
-                        st.session_state.df.at[index, 'Stop_Loss'] = row['Entry_Price']
-                        st.session_state.df.at[index, 'Notes'] += "T1 Hit. "
-                        st.rerun()
-                
-                if c3.button("💰 全部平仓", key=f"close_{row['ID']}"):
-                    exit_price = st.number_input("平仓价", key=f"p_{row['ID']}")
-                    if exit_price > 0:
-                        st.session_state.df.at[index, 'Status'] = 'Closed'
-                        # 简易计算
-                        qty = row['Quantity'] if row['Status'] == 'Open' else row['Quantity'] / 2
-                        pl = (exit_price - row['Entry_Price']) * qty if "Long" in row['Direction'] else (row['Entry_Price'] - exit_price) * qty
-                        st.session_state.df.at[index, 'P_L'] += pl
-                        st.rerun()
+        max_qty = 10000
+        
+    qty = st.number_input("买入数量 (张/股)", min_value=1, max_value=max_qty, value=1)
 
-# --- Tab 3: 历史 ---
-with tab3:
-    st.header("📜 历史记录")
-    st.dataframe(st.session_state.df)
+    # 资金检查
+    total_cost = entry_price * qty
+    fees = 0.0
+    
+    if "Option" in market_type:
+        fees = calculate_fees("US_Option", qty, entry_price)
+        st.caption(f"预计总手续费 (买+卖): ${fees}")
+        if total_cost + fees/2 > capital_option:
+            st.error(f"❌ 钱不够！需要 ${total_cost + fees/2:.2f}，你只有 ${capital_option}")
+    elif "CBBC" in market_type:
+        fees = calculate_fees("HK_CBBC", qty, entry_price, total_cost)
+        st.caption(f"预计总手续费 (买+卖): HK${fees}")
+        if total_cost + fees/2 > capital_cbbc:
+            st.error(f"❌ 钱不够！需要 HK${total_cost + fees/2:.2f}，你只有 HK${capital_cbbc}")
+
+with col2:
+    st.subheader("2. 盈亏模拟器 (所见即所得)")
+    
+    if entry_price > 0:
+        # 止损止盈设置
+        stop_loss = st.number_input("止损价 (打到这必须跑)", value=entry_price * 0.9, format="%.3f")
+        target_price = st.number_input("目标价 (止盈)", value=entry_price * 1.2, format="%.3f")
+        
+        # 模拟计算
+        potential_loss = (abs(entry_price - stop_loss) * qty) + fees
+        potential_profit = (abs(target_price - entry_price) * qty) - fees
+        
+        # 展示卡片
+        c1, c2 = st.columns(2)
+        c1.metric("😭 如果止损 (含手续费)", f"-{potential_loss:.2f}", delta_color="inverse")
+        c2.metric("🤑 如果止盈 (扣手续费)", f"+{potential_profit:.2f}")
+        
+        # 盈亏比计算
+        if potential_loss > 0:
+            rr = potential_profit / potential_loss
+            if rr > 2:
+                st.success(f"✅ 盈亏比 {rr:.2f} : 1 (值得博！)")
+            else:
+                st.warning(f"⚠️ 盈亏比 {rr:.2f} : 1 (不太划算，手续费吃太多了)")
+        
+        # 动态滑块
+        st.write("---")
+        st.write("🎚️ **拖动滑块，看看价格变动对钱包的影响：**")
+        sim_change = st.slider("价格变化 %", -50, 100, 0)
+        sim_price = entry_price * (1 + sim_change / 100.0)
+        
+        if "Long" in direction:
+            gross_pl = (sim_price - entry_price) * qty
+        else:
+            gross_pl = (entry_price - sim_price) * qty
+            
+        net_pl = gross_pl - fees # 扣除双边手续费
+        
+        st.write(f"价格变为: **{sim_price:.3f}**")
+        if net_pl > 0:
+            st.markdown(f"### 🎉 净赚: **+{net_pl:.2f}**")
+        else:
+            st.markdown(f"### 💸 净亏: **{net_pl:.2f}**")
+            
+        # 记录按钮
+        if st.button("📝 既然算好了，就记下来！", type="primary"):
+            new_trade = {
+                "ID": datetime.now().strftime("%H%M%S"),
+                "Date": datetime.now().strftime("%Y-%m-%d"),
+                "Market": market_type,
+                "Symbol": symbol,
+                "Direction": direction,
+                "Entry_Price": entry_price,
+                "Quantity": qty,
+                "Stop_Loss": stop_loss,
+                "Target": target_price,
+                "Fees_Est": fees,
+                "Status": "Open",
+                "P_L": 0.0,
+                "Notes": ""
+            }
+            st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_trade])], ignore_index=True)
+            st.toast("已保存到下方表格")
+
+st.markdown("---")
+st.subheader("📋 交易记录本")
+
+# 显示记录
+st.dataframe(st.session_state.df)
+
+# 数据下载区
+csv = st.session_state.df.to_csv(index=False).encode('utf-8')
+st.download_button(
+    "💾 下载备份 (记得每天点一下)",
+    csv,
+    "my_trading_journal.csv",
+    "text/csv",
+    key='download-csv'
+)
+
+# 上传区
+uploaded = st.file_uploader("📥 上传旧数据", type="csv")
+if uploaded:
+    if st.button("加载数据"):
+        st.session_state.df = pd.read_csv(uploaded)
+        st.rerun()
